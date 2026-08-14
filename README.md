@@ -1,5 +1,8 @@
 # luckyday · 飞书机器人
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![Node.js](https://img.shields.io/badge/node-%3E%3D18-339933?logo=node.js&logoColor=white)](https://nodejs.org)
+
 把 `lucky-barista` 专家 Skill（五阶段饮品研发对话）搬到飞书群聊/私聊里，走完流程后通过瑞幸点单 MCP
 完成预览下单。复用 `luckin` CLI 已验证可用的模型配置和 MCP 登录态，不重复造轮子。
 
