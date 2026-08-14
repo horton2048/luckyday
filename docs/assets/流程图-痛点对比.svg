@@ -1,0 +1,95 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="620" viewBox="0 0 1400 620" font-family="-apple-system, PingFang SC, Microsoft YaHei, sans-serif">
+  <rect width="1400" height="620" fill="#ffffff"/>
+
+  <!-- Title -->
+  <text x="700" y="40" text-anchor="middle" font-size="24" font-weight="700" fill="#1a1a1a">团队/会议咖啡下单：Before vs After</text>
+
+  <!-- Row labels -->
+  <text x="40" y="140" font-size="18" font-weight="700" fill="#8a5a2b">Before</text>
+  <text x="40" y="430" font-size="18" font-weight="700" fill="#1a6b4a">After（飞书数字员工）</text>
+
+  <!-- ===== BEFORE ROW ===== -->
+  <!-- step boxes -->
+  <g font-size="14" fill="#3a3a3a">
+    <rect x="110" y="90" width="190" height="90" rx="10" fill="#fdf1e6" stroke="#d99a4e" stroke-width="1.5"/>
+    <text x="205" y="125" text-anchor="middle" font-weight="600">HR/老板要给团队</text>
+    <text x="205" y="145" text-anchor="middle">/客户点单</text>
+
+    <rect x="350" y="90" width="220" height="90" rx="10" fill="#fdf1e6" stroke="#d99a4e" stroke-width="1.5"/>
+    <text x="460" y="118" text-anchor="middle" font-weight="600">逐一打开小程序</text>
+    <text x="460" y="138" text-anchor="middle">为每个人配置口味</text>
+    <text x="460" y="158" text-anchor="middle">（或群里接龙）</text>
+
+    <rect x="620" y="90" width="220" height="90" rx="10" fill="#fdf1e6" stroke="#d99a4e" stroke-width="1.5"/>
+    <text x="730" y="118" text-anchor="middle" font-weight="600">员工/HR 垫钱</text>
+    <text x="730" y="138" text-anchor="middle">或群内 AA</text>
+    <text x="730" y="158" text-anchor="middle">（跳出工作场景）</text>
+
+    <rect x="890" y="90" width="220" height="90" rx="10" fill="#fdf1e6" stroke="#d99a4e" stroke-width="1.5"/>
+    <text x="1000" y="118" text-anchor="middle" font-weight="600">事后找财务/老板</text>
+    <text x="1000" y="138" text-anchor="middle">报销</text>
+
+    <rect x="1160" y="90" width="200" height="90" rx="10" fill="#fbe4e4" stroke="#c65b5b" stroke-width="1.5"/>
+    <text x="1260" y="118" text-anchor="middle" font-weight="700" fill="#a13d3d">耗时 5–10 分钟</text>
+    <text x="1260" y="138" text-anchor="middle" fill="#a13d3d">易漏单/记错口味</text>
+    <text x="1260" y="158" text-anchor="middle" fill="#a13d3d">无预定能力</text>
+  </g>
+
+  <!-- Before arrows -->
+  <g stroke="#c98a3f" stroke-width="2" fill="none" marker-end="url(#arrowBefore)">
+    <path d="M300 135 L348 135"/>
+    <path d="M570 135 L618 135"/>
+    <path d="M840 135 L888 135"/>
+    <path d="M1110 135 L1158 135"/>
+  </g>
+
+  <!-- ===== AFTER ROW ===== -->
+  <g font-size="14" fill="#1a3a2e">
+    <rect x="110" y="380" width="190" height="90" rx="10" fill="#e9f7ef" stroke="#3f9d6e" stroke-width="1.5"/>
+    <text x="205" y="415" text-anchor="middle" font-weight="600">HR/老板在飞书群里</text>
+    <text x="205" y="435" text-anchor="middle">@ 瑞幸数字员工</text>
+
+    <rect x="350" y="380" width="220" height="90" rx="10" fill="#e9f7ef" stroke="#3f9d6e" stroke-width="1.5"/>
+    <text x="460" y="408" text-anchor="middle" font-weight="600">一句话收集多人偏好</text>
+    <text x="460" y="428" text-anchor="middle">（记得住历史口味）</text>
+    <text x="460" y="448" text-anchor="middle">自动合并成一单</text>
+
+    <rect x="620" y="380" width="220" height="90" rx="10" fill="#e9f7ef" stroke="#3f9d6e" stroke-width="1.5"/>
+    <text x="730" y="408" text-anchor="middle" font-weight="600">真实调用 MCP</text>
+    <text x="730" y="428" text-anchor="middle">previewOrder → createOrder</text>
+    <text x="730" y="448" text-anchor="middle">防幻觉校验兜底</text>
+
+    <rect x="890" y="380" width="220" height="90" rx="10" fill="#e9f7ef" stroke="#3f9d6e" stroke-width="1.5"/>
+    <text x="1000" y="408" text-anchor="middle" font-weight="600">支付二维码</text>
+    <text x="1000" y="428" text-anchor="middle">直接推送到群里</text>
+    <text x="1000" y="448" text-anchor="middle">费用挂企业账号</text>
+
+    <rect x="1160" y="380" width="200" height="90" rx="10" fill="#dff3e7" stroke="#2f8a5c" stroke-width="1.5"/>
+    <text x="1260" y="408" text-anchor="middle" font-weight="700" fill="#1f6b45">耗时 1–2 分钟</text>
+    <text x="1260" y="428" text-anchor="middle" fill="#1f6b45">全程不离开飞书</text>
+    <text x="1260" y="448" text-anchor="middle" fill="#1f6b45">可设定时批量下单</text>
+  </g>
+
+  <!-- After arrows -->
+  <g stroke="#2f8a5c" stroke-width="2" fill="none" marker-end="url(#arrowAfter)">
+    <path d="M300 425 L348 425"/>
+    <path d="M570 425 L618 425"/>
+    <path d="M840 425 L888 425"/>
+    <path d="M1110 425 L1158 425"/>
+  </g>
+
+  <!-- Divider -->
+  <line x1="60" y1="270" x2="1340" y2="270" stroke="#e0e0e0" stroke-width="1.5" stroke-dasharray="6,6"/>
+
+  <!-- Bottom note -->
+  <text x="700" y="560" text-anchor="middle" font-size="14" fill="#666666">数字员工由瑞幸官方自建、自己拥有 —— 不依赖第三方 AI 平台调用，掌握用户交互数据与调用权</text>
+
+  <defs>
+    <marker id="arrowBefore" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 Z" fill="#c98a3f"/>
+    </marker>
+    <marker id="arrowAfter" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 Z" fill="#2f8a5c"/>
+    </marker>
+  </defs>
+</svg>
