@@ -57,6 +57,72 @@ export const RESOLVE_DIY_TOOL = {
   },
 };
 
+// 预约下单：不立刻 createOrder，把已经用 previewOrder 验证过的真实 productList 存起来，
+// 到约定时间由服务器端的调度器自动 createOrder。跟 previewOrder/createOrder 一样必须防幻觉校验。
+export const SCHEDULE_ORDER_TOOL = {
+  type: "function",
+  function: {
+    name: "scheduleOrder",
+    description:
+      "用户明确要求把已经用 previewOrder 报价确认过的订单，安排到未来某个时间点自动下单" +
+      "（而不是现在立刻下单）时调用。deptId/productList 必须是本轮 previewOrder 真实验证过的值。" +
+      "调用后不会立刻下单，到点由系统自动执行并推送支付二维码。",
+    parameters: {
+      type: "object",
+      properties: {
+        executeAt: {
+          type: "string",
+          description: "ISO 8601 时间（带时区），比如 2026-08-16T08:00:00+08:00，代表几点自动下单，" +
+            "需要结合对话里系统提示的当前时间换算相对时间（比如'明天早上8点'）",
+        },
+        deptId: { type: "number" },
+        productList: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              amount: { type: "number" },
+              productId: { type: "number" },
+              skuCode: { type: "string" },
+            },
+            required: ["amount", "productId", "skuCode"],
+          },
+        },
+        longitude: { type: "number" },
+        latitude: { type: "number" },
+        couponCodeList: { type: "array", items: { type: "string" }, description: "可选" },
+        summary: { type: "string", description: "给用户看的一句话摘要，比如'明天8点 生椰杨枝甘露 超大杯'" },
+      },
+      required: ["executeAt", "deptId", "productList", "summary"],
+    },
+  },
+};
+
+// 口味记忆：用户在对话里（不管最后有没有下单）明确说出自己或某位同事的偏好时调用，
+// 方便以后"按大家平时的口味"直接点单，不用每次重新问一遍。这是个静默记录工具，
+// 不打断对话主线——调用后正常继续当前流程即可，不需要 __stop。
+export const RECORD_TASTE_TOOL = {
+  type: "function",
+  function: {
+    name: "recordTaste",
+    description:
+      "当用户明确说出自己或某位同事的口味偏好时调用（不管最后有没有下单），比如" +
+      "'我不喝咖啡'、'XX喜欢清爽果香的'、'XX只喝美式'。用于以后自动按记忆点单。" +
+      "只有这轮对话里真的听到了具体内容才调用；不知道某人口味时绝对不要编一个" +
+      "'待确认'/'待定'这样的占位内容调用本工具去'占坑'——宁可不调用，也不能用占位覆盖掉" +
+      "可能已经存在的真实记录。系统提示里给出的\"已知口味偏好\"是历史记忆，用来参考回答，" +
+      "不需要针对这些历史记忆再调用本工具。",
+    parameters: {
+      type: "object",
+      properties: {
+        person: { type: "string", description: "这个偏好是谁的：'self' 表示当前说话人自己，否则填群里那个人的真实姓名" },
+        summary: { type: "string", description: "一句话口味总结，比如'不喝咖啡，喜欢清爽果香、不加糖'" },
+      },
+      required: ["person", "summary"],
+    },
+  },
+};
+
 // MiniMax-M3 会自信地"记住"一些真实商品的 productId/skuCode（大概率是训练数据里见过瑞幸的公开信息），
 // 哪怕本轮对话从没真正调用过 searchProductForMcp 查到这个商品，也能编出恰好合法的参数。
 // 这在下单场景不可接受——蒙对是运气，蒙错就是真实扣错钱。所以 previewOrder/createOrder
@@ -169,36 +235,40 @@ export async function runBaristaTurn({ systemPrompt, history, mcpUrl, mcpToken, 
     }
 
     messages.push(msg);
+    // 模型有时会在同一条消息里一次性调用好几个工具（比如"顺手记个口味 + 同时收敛 DIY"）。
+    // 之前的 bug：遇到 __stop 工具就立刻 return，如果它不是这一批里最后一个，排在后面的
+    // 工具调用永远得不到回应，historyi 里留下悬空 tool_call，下一轮直接被 LLM API 400 拒掉。
+    // 现在改成：这一批全部处理完、每个都有回应之后，再统一决定要不要提前结束这一轮。
+    let stopResult = null;
     for (const call of msg.tool_calls) {
       const args = JSON.parse(call.function.arguments || "{}");
       console.log(`[工具调用] step=${step} tool=${call.function.name} args=${JSON.stringify(args)}`);
 
-      if (localToolNames.has(call.function.name)) {
-        const handled = localToolHandler?.(call.function.name, args);
-        // 无论是否 __stop 提前结束，都必须先把这条 tool_call 的响应回填进历史，
-        // 否则下一轮历史里会有一个没有回应的 tool_call，LLM API 会用 400 拒掉整个会话。
-        messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(handled ?? {}) });
-        if (handled?.__stop) {
-          return { ...handled, updatedHistory: messages.slice(1) };
-        }
-        continue;
-      }
-
-      let result;
-      if (call.function.name === "previewOrder" || call.function.name === "createOrder") {
+      // 商品防幻觉校验：previewOrder/createOrder/scheduleOrder 三个都会让商品真正流向下单，
+      // 必须在分发给本地工具或 MCP 之前统一拦一遍，不能因为 scheduleOrder 是本地工具就绕过去。
+      if (["previewOrder", "createOrder", "scheduleOrder"].includes(call.function.name)) {
         const knownPairs = extractKnownProductPairs(messages);
         const ungrounded = findUngroundedItems(args, knownPairs);
         if (ungrounded.length > 0) {
           console.error(`[拦截未验证商品] tool=${call.function.name} ungrounded=${JSON.stringify(ungrounded)}`);
-          result = {
+          const result = {
             error:
-              "这些商品的 productId/skuCode 在本次对话里没有被 searchProductForMcp 或 queryProductDetailInfo 真实验证过，禁止直接下单/预览。请先调用 searchProductForMcp 查到真实商品，再用查到的真实字段重试。",
+              "这些商品的 productId/skuCode 在本次对话里没有被 searchProductForMcp 或 queryProductDetailInfo 真实验证过，禁止直接下单/预约/预览。请先调用 searchProductForMcp 查到真实商品，再用查到的真实字段重试。",
             ungroundedItems: ungrounded,
           };
           messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
           continue;
         }
       }
+
+      if (localToolNames.has(call.function.name)) {
+        const handled = await localToolHandler?.(call.function.name, args);
+        messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(handled ?? {}) });
+        if (handled?.__stop && !stopResult) stopResult = handled;
+        continue;
+      }
+
+      let result;
       try {
         result = await mcpCallTool(mcpUrl, mcpToken, call.function.name, args);
         console.log(`[工具结果] tool=${call.function.name} result=${JSON.stringify(result).slice(0, 500)}`);
@@ -211,6 +281,10 @@ export async function runBaristaTurn({ systemPrompt, history, mcpUrl, mcpToken, 
         console.error(`[工具失败] tool=${call.function.name} error=${err.stack || err}`);
       }
       messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
+    }
+
+    if (stopResult) {
+      return { ...stopResult, updatedHistory: messages.slice(1) };
     }
   }
 
