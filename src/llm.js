@@ -107,6 +107,33 @@ function sanitizeReply(text) {
     .trim();
 }
 
+// 429/5xx/529 是服务商那边的瞬时容量问题，重试大概率能过；400 之类是我们自己传参有问题，
+// 重试没用、只会掩盖真实 bug，必须立刻抛出。
+const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504, 529]);
+const MAX_LLM_RETRIES = 3;
+
+async function callLlmWithRetry(body) {
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(`${process.env.LLM_BASE_URL}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.LLM_API_KEY}`,
+      },
+      body: JSON.stringify(body),
+    });
+    if (res.ok) return res.json();
+
+    const text = await res.text();
+    if (!RETRYABLE_STATUS.has(res.status) || attempt >= MAX_LLM_RETRIES) {
+      throw new Error(`LLM HTTP ${res.status}: ${text}`);
+    }
+    const delayMs = 1000 * 2 ** attempt;
+    console.error(`[LLM ${res.status}，${delayMs}ms 后重试 (${attempt + 1}/${MAX_LLM_RETRIES})] ${text.slice(0, 200)}`);
+    await new Promise((r) => setTimeout(r, delayMs));
+  }
+}
+
 /**
  * @param {object} opts
  * @param {string} opts.systemPrompt
@@ -127,21 +154,12 @@ export async function runBaristaTurn({ systemPrompt, history, mcpUrl, mcpToken, 
 
   const MAX_STEPS = 10;
   for (let step = 0; step < MAX_STEPS; step++) {
-    const res = await fetch(`${process.env.LLM_BASE_URL}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${process.env.LLM_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: process.env.LLM_MODEL,
-        messages,
-        tools,
-        thinking: { type: "disabled" },
-      }),
+    const data = await callLlmWithRetry({
+      model: process.env.LLM_MODEL,
+      messages,
+      tools,
+      thinking: { type: "disabled" },
     });
-    if (!res.ok) throw new Error(`LLM HTTP ${res.status}: ${await res.text()}`);
-    const data = await res.json();
     const msg = data.choices[0].message;
 
     if (!msg.tool_calls?.length) {
@@ -157,10 +175,12 @@ export async function runBaristaTurn({ systemPrompt, history, mcpUrl, mcpToken, 
 
       if (localToolNames.has(call.function.name)) {
         const handled = localToolHandler?.(call.function.name, args);
-        if (handled?.__stop) {
-          return { ...handled, updatedHistory: [...messages.slice(1), msg] };
-        }
+        // 无论是否 __stop 提前结束，都必须先把这条 tool_call 的响应回填进历史，
+        // 否则下一轮历史里会有一个没有回应的 tool_call，LLM API 会用 400 拒掉整个会话。
         messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(handled ?? {}) });
+        if (handled?.__stop) {
+          return { ...handled, updatedHistory: messages.slice(1) };
+        }
         continue;
       }
 
