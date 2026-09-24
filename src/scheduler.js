@@ -5,7 +5,9 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { mcpCallTool } from "./mcpClient.js";
-import { replyText, replyImageFromUrl } from "./feishu.js";
+import { replyCard, replyImageKey, uploadImageFromUrl } from "./feishu.js";
+import { buildPaymentCard } from './cards.js';
+import { randomUUID } from 'node:crypto';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const STORE_PATH = join(__dirname, "../data/scheduled-orders.json");
@@ -24,7 +26,7 @@ function saveAll(list) {
 export function addScheduledOrder(entry) {
   const list = loadAll();
   const record = {
-    id: `sched_${Date.now()}`,
+    id: `sched_${randomUUID()}`,
     status: "pending",
     createdAt: new Date().toISOString(),
     ...entry,
@@ -38,46 +40,45 @@ export function listScheduledOrders() {
   return loadAll();
 }
 
-async function runDueOrders(mcpUrl, mcpToken) {
-  const list = loadAll();
-  const now = Date.now();
-  let dirty = false;
-
-  for (const item of list) {
-    if (item.status !== "pending") continue;
-    if (new Date(item.executeAt).getTime() > now) continue;
-
-    dirty = true;
-    try {
-      const result = await mcpCallTool(mcpUrl, mcpToken, "createOrder", {
-        deptId: item.deptId,
-        productList: item.productList,
-        longitude: item.longitude,
-        latitude: item.latitude,
-        ...(item.couponCodeList ? { couponCodeList: item.couponCodeList } : {}),
-      });
-      item.status = "done";
-      item.result = result;
-      await replyText(item.chatId, `预约到点了，已经帮你下单：${item.summary}。扫下面二维码支付～`);
-      if (result?.data?.payOrderQrCodeUrl) {
-        await replyImageFromUrl(item.chatId, result.data.payOrderQrCodeUrl).catch((err) =>
-          console.error("预约单发二维码失败:", err)
-        );
-      }
-    } catch (err) {
-      item.status = "failed";
-      item.error = String(err);
-      console.error(`[预约单执行失败] id=${item.id}`, err);
-      await replyText(item.chatId, `预约的"${item.summary}"到点了，但下单失败了，麻烦手动下一单。`).catch(() => {});
+export async function executeScheduled(item,{call,persist,onNeedsConfirmation,notify}) {
+  const args={deptId:item.deptId,productList:item.productList};
+  let creating=false;
+  try {
+    const preview=await call('previewOrder',args);
+    const price=preview?.data?.discountPrice??preview?.data?.totalPrice??preview?.data?.price;
+    if(preview?.success===false||preview?.code!==0||price==null||item.authorizedPrice==null||Number(price)!==Number(item.authorizedPrice)) {
+      item.status='needs_confirmation';await persist(item);
+      await onNeedsConfirmation(item,'预约到点了，价格或可售情况需要重新确认。');return;
     }
+    if(Array.isArray(preview.data.couponCodeList))args.couponCodeList=preview.data.couponCodeList;
+    item.status='processing';await persist(item);creating=true;
+    const result=await call('createOrder',args);
+    if(!result?.data?.payOrderQrCodeUrl)throw new Error('未取得支付二维码，需要核对订单结果');
+    item.status='done';item.result=result;await persist(item);
+    await notify(item,result);
+  }catch(err){
+    if(item.status==='done'){item.notificationError=String(err);await persist(item);return;}
+    item.status=creating?'uncertain':'needs_confirmation';item.error=String(err);await persist(item);
+    if(!creating)await onNeedsConfirmation(item,'预约报价暂时不可用，可在卡片中重新选择。');
+    else console.error(`[预约订单结果待核对] ${item.id}`);
   }
-
-  if (dirty) saveAll(list);
 }
 
-export function startScheduler(mcpUrl, mcpToken) {
+export function startScheduler(mcpUrl, mcpToken, {onNeedsConfirmation} = {}) {
+  let running=false;
+  const persist=async item=>{const all=loadAll();const i=all.findIndex(x=>x.id===item.id);if(i>=0){all[i]=item;saveAll(all);}};
   setInterval(() => {
-    runDueOrders(mcpUrl, mcpToken).catch((err) => console.error("[预约单轮询异常]", err));
+    if(running)return;running=true;
+    void (async()=>{
+      for(const item of loadAll()) {
+        if(item.status!=='pending'||!Number.isFinite(new Date(item.executeAt).getTime())||new Date(item.executeAt).getTime()>Date.now())continue;
+        await executeScheduled(item,{
+          call:(name,args)=>mcpCallTool(mcpUrl,mcpToken,name,args),persist,
+          onNeedsConfirmation:onNeedsConfirmation??(async()=>{}),
+          notify:async(item,result)=>{const imageKey=await uploadImageFromUrl(result.data.payOrderQrCodeUrl);await replyCard(item.chatId,buildPaymentCard({order:{result},imageKey}));await replyImageKey(item.chatId,imageKey);},
+        });
+      }
+    })().catch(err=>console.error('[预约轮询失败]',err.message)).finally(()=>{running=false;});
   }, POLL_INTERVAL_MS);
   console.log(`预约下单调度器已启动，每 ${POLL_INTERVAL_MS / 1000}s 检查一次`);
 }

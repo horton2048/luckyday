@@ -1,12 +1,16 @@
 // OpenAI 兼容 chat completions，带 MCP 工具 + 本地伪工具的函数调用 loop。
 import { mcpCallTool, mcpListTools } from "./mcpClient.js";
+import { taskSignal, assertTaskActive } from './taskContext.js';
+import { cleanHistory } from './session.js';
 
 // 工具 schema 直接从 MCP 服务器的 tools/list 拉取并原样转发给模型，
 // 不再手写猜测参数名——手写的 items/quantity 曾经是猜错的，真实字段是 productList/amount。
 let cachedMcpTools = null;
 
-export async function loadMcpTools(mcpUrl, mcpToken) {
-  const raw = await mcpListTools(mcpUrl, mcpToken);
+export async function loadMcpTools(mcpUrl, mcpToken, { additionalServers = [] } = {}) {
+  const servers = [{ url: mcpUrl, token: mcpToken }, ...additionalServers];
+  const rawLists = await Promise.all(servers.map((server) => mcpListTools(server.url, server.token)));
+  const raw = rawLists.flat();
   cachedMcpTools = raw.map((t) => ({
     type: "function",
     function: { name: t.name, description: t.description, parameters: t.inputSchema },
@@ -14,45 +18,37 @@ export async function loadMcpTools(mcpUrl, mcpToken) {
   return cachedMcpTools;
 }
 
-// DIY 收集模式专用的"本地伪工具"：不打 MCP，只是让模型用结构化方式
-// 报告收敛结果，代码据此决定"转下单"还是"写愿望单"，同时不把 JSON 暴露给用户。
-export const RESOLVE_DIY_TOOL = {
+// 许愿池的"本地伪工具"：菜单确实做不出来时调用，把这杯记进愿望池。
+// 不打 MCP，只是让模型用结构化方式报告"为什么做不出来"，代码据此写愿望 + 回卡片。
+// 用户原话由代码从消息里直接取，不经过模型改写——这是许愿池的底线：原话永远不被覆盖。
+export const SAVE_WISH_TOOL = {
   type: "function",
   function: {
-    name: "resolveDiy",
+    name: "saveWish",
     description:
-      "DIY 收集访谈收敛时调用，报告结果。这不是真实下单，只是内部信号。" +
-      "一次可以报告一杯或多杯（比如给几位同事分别点不同的），items 数组每条对应一杯。",
+      "菜单里确实找不到接近的商品、用户想要的这杯现在做不出来时调用，把它记进许愿池。" +
+      "调用前必须先用 searchProductForMcp 在门店里查过、确认真的没有接近的商品。" +
+      "用户的原话会被系统完整保留，你不要改写、不要替它起名，只补充结构化字段和做不出来的原因。",
     parameters: {
       type: "object",
       properties: {
-        items: {
-          type: "array",
-          description: "每杯一条记录，至少一条",
-          items: {
-            type: "object",
-            properties: {
-              label: { type: "string", description: "这杯是给谁的，比如'领导1'，单人单杯时可省略" },
-              matched: { type: "boolean", description: "是否找到了接近的现有商品" },
-              productHint: { type: "string", description: "matched=true 时，商品名称或关键词，用于后续 searchProductForMcp" },
-              collected: {
-                type: "object",
-                description: "收集到的用户偏好",
-                properties: {
-                  taste: { type: "string" },
-                  coffeeIntensity: { type: "string" },
-                  temperature: { type: "string" },
-                  sweetness: { type: "string" },
-                  flavor: { type: "string" },
-                },
-              },
-              gapReason: { type: "string", description: "matched=false 时，为什么现有菜单做不出来" },
-            },
-            required: ["matched"],
+        fields: {
+          type: "object",
+          description: "从用户话里能确定的口味维度，填不出来的留空",
+          properties: {
+            taste: { type: "string" },
+            coffeeIntensity: { type: "string" },
+            temperature: { type: "string" },
+            sweetness: { type: "string" },
+            flavor: { type: "string" },
           },
         },
+        gapReason: {
+          type: "string",
+          description: "为什么现有菜单做不出这杯（缺少什么风味/形态/配料），要具体，不要只写\"没有这个产品\"",
+        },
       },
-      required: ["items"],
+      required: ["gapReason"],
     },
   },
 };
@@ -127,7 +123,7 @@ export const RECORD_TASTE_TOOL = {
 // 哪怕本轮对话从没真正调用过 searchProductForMcp 查到这个商品，也能编出恰好合法的参数。
 // 这在下单场景不可接受——蒙对是运气，蒙错就是真实扣错钱。所以 previewOrder/createOrder
 // 的每个商品，必须能在"本会话真实工具结果"里追溯到同一个 productId+skuCode 组合，否则拦截。
-function extractKnownProductPairs(messages) {
+function extractKnownProductPairs(messages, deptId) {
   const known = new Set();
   const visit = (node) => {
     if (Array.isArray(node)) {
@@ -141,10 +137,18 @@ function extractKnownProductPairs(messages) {
       Object.values(node).forEach(visit);
     }
   };
+  const calls = new Map();
   for (const m of messages) {
+    for (const call of m.tool_calls ?? []) calls.set(call.id, call.function);
     if (m.role !== "tool") continue;
     try {
-      visit(JSON.parse(m.content));
+      const call = calls.get(m.tool_call_id);
+      if (!["searchProductForMcp", "queryProductDetailInfo", "switchProduct"].includes(call?.name)) continue;
+      const args = JSON.parse(call.arguments);
+      if (String(args.deptId) !== String(deptId)) continue;
+      const result = JSON.parse(m.content);
+      if (result.error || result.success === false || (result.code != null && Number(result.code) !== 0)) continue;
+      visit(result.data);
     } catch {
       // 非 JSON 的 tool 消息忽略
     }
@@ -187,6 +191,7 @@ async function callLlmWithRetry(body) {
         Authorization: `Bearer ${process.env.LLM_API_KEY}`,
       },
       body: JSON.stringify(body),
+      signal: taskSignal(90_000),
     });
     if (res.ok) return res.json();
 
@@ -200,26 +205,48 @@ async function callLlmWithRetry(body) {
   }
 }
 
+// 一次性的 JSON 判断调用（不带工具、不维护历史）：许愿池的语义聚类用它。
+// 有的模型不认 response_format，所以改成"提示里要 JSON + 从回复里抠第一段 JSON"，
+// 兼容性最好；抠不出来就当失败，由调用方降级处理。
+export async function chatJson({ system, user, maxTokens = 500 }) {
+  const data = await callLlmWithRetry({
+    model: process.env.LLM_MODEL,
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+    max_tokens: maxTokens,
+    thinking: { type: "disabled" },
+  });
+  const content = data?.choices?.[0]?.message?.content ?? "";
+  const match = content.match(/\{[\s\S]*\}/);
+  if (!match) throw new Error(`LLM 未返回可解析的 JSON: ${content.slice(0, 200)}`);
+  return JSON.parse(match[0]);
+}
+
 /**
  * @param {object} opts
  * @param {string} opts.systemPrompt
  * @param {array} opts.history
  * @param {string} opts.mcpUrl
  * @param {string} opts.mcpToken
- * @param {array} [opts.extraTools] 额外的本地伪工具（如 RESOLVE_DIY_TOOL）
+ * @param {array} [opts.extraTools] 额外的本地伪工具（如 SAVE_WISH_TOOL）
  * @param {(name: string, args: object) => object|null} [opts.localToolHandler]
  *        命中本地伪工具名时调用；返回值会作为 tool 消息内容回填给模型继续对话。
  *        如果 handler 返回 { __stop: true, ... } 则立即结束这轮，把 rest 字段透传给调用方。
  */
-export async function runBaristaTurn({ systemPrompt, history, mcpUrl, mcpToken, extraTools = [], localToolHandler }) {
-  const messages = [{ role: "system", content: systemPrompt }, ...history];
-  const tools = [...(cachedMcpTools ?? []), ...extraTools];
+export async function runBaristaTurn({ systemPrompt, history, mcpUrl, mcpToken, mcpServers = [], extraTools = [], localToolHandler, cardMode = false, disableMcp = false, lockedDeptId = null }) {
+  const messages = [{ role: "system", content: systemPrompt }, ...cleanHistory(history, 100)];
+  const tools = [...(disableMcp ? [] : (cachedMcpTools ?? [])), ...extraTools].filter(t => !cardMode || !['createOrder', 'scheduleOrder'].includes(t.function.name));
   const localToolNames = new Set(extraTools.map((t) => t.function.name));
   let orderQrCodeUrl = null;
   let orderedItems = null;
+  let previewOrder = null;
+  let missingPreviewRetries = 0;
 
   const MAX_STEPS = 10;
   for (let step = 0; step < MAX_STEPS; step++) {
+    assertTaskActive();
     const data = await callLlmWithRetry({
       model: process.env.LLM_MODEL,
       messages,
@@ -229,25 +256,48 @@ export async function runBaristaTurn({ systemPrompt, history, mcpUrl, mcpToken, 
     const msg = data.choices[0].message;
 
     if (!msg.tool_calls?.length) {
+      // Models sometimes quote catalog prices and ask for confirmation without previewing.
+      // That produces text only, bypassing the confirmation-card path in server.js.
+      const asksToConfirm = /确认.{0,8}(下单|订单|支付)|是否.{0,8}(下单|支付)|可以.{0,4}下单|要.{0,4}下单吗/.test(msg.content ?? "");
+      if (!previewOrder && !orderQrCodeUrl && asksToConfirm) {
+        if (missingPreviewRetries++ < 2 && step < MAX_STEPS - 1) {
+          messages.push(msg, { role: "system", content: "程序校验：本轮尚未取得成功的 previewOrder。不能用商品目录价格让用户确认下单。请对当前门店、当前商品和数量调用 previewOrder；信息不足则询问缺失项，接口失败则明确说明，禁止假称订单已准备好。" });
+          continue;
+        }
+        const fallback = { role: "assistant", content: "还没取得当前门店的有效报价，暂时无法生成确认卡，请稍后重试。" };
+        return { reply: fallback.content, updatedHistory: [...messages.slice(1), fallback], orderQrCodeUrl, orderedItems, previewOrder: null };
+      }
       // 必须把这轮的完整轨迹（含工具调用/结果）存回历史，否则下一轮模型会忘记
       // 真实的 productId/skuCode 等字段，转而凭记忆瞎编——这是之前踩到的真实 bug。
-      return { reply: sanitizeReply(msg.content), updatedHistory: [...messages.slice(1), msg], orderQrCodeUrl, orderedItems };
+      return { reply: sanitizeReply(msg.content), updatedHistory: [...messages.slice(1), msg], orderQrCodeUrl, orderedItems, previewOrder };
     }
 
     messages.push(msg);
-    // 模型有时会在同一条消息里一次性调用好几个工具（比如"顺手记个口味 + 同时收敛 DIY"）。
+    // 模型有时会在同一条消息里一次性调用好几个工具（比如"顺手记个口味 + 同时把愿望记进许愿池"）。
     // 之前的 bug：遇到 __stop 工具就立刻 return，如果它不是这一批里最后一个，排在后面的
     // 工具调用永远得不到回应，historyi 里留下悬空 tool_call，下一轮直接被 LLM API 400 拒掉。
     // 现在改成：这一批全部处理完、每个都有回应之后，再统一决定要不要提前结束这一轮。
     let stopResult = null;
     for (const call of msg.tool_calls) {
+      assertTaskActive();
+      if (cardMode && ['createOrder','scheduleOrder'].includes(call.function.name)) {
+        messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify({ error: '请通过订单卡片确认下单。' }) });
+        continue;
+      }
       const args = JSON.parse(call.function.arguments || "{}");
+      if(lockedDeptId!=null && ['searchProductForMcp','queryProductDetailInfo','switchProduct','previewOrder','createOrder','scheduleOrder'].includes(call.function.name) && String(args.deptId)!==String(lockedDeptId)) {
+        previewOrder=null;
+        messages.push({role:'tool',tool_call_id:call.id,content:JSON.stringify({error:'门店与用户已选门店不一致，已拦截。请使用已确认的 deptId 重新查询商品。',deptId:lockedDeptId})});
+        continue;
+      }
+      if (previewOrder && args.deptId != null && String(args.deptId) !== String(previewOrder.args.deptId)) previewOrder = null;
       console.log(`[工具调用] step=${step} tool=${call.function.name} args=${JSON.stringify(args)}`);
 
       // 商品防幻觉校验：previewOrder/createOrder/scheduleOrder 三个都会让商品真正流向下单，
       // 必须在分发给本地工具或 MCP 之前统一拦一遍，不能因为 scheduleOrder 是本地工具就绕过去。
       if (["previewOrder", "createOrder", "scheduleOrder"].includes(call.function.name)) {
-        const knownPairs = extractKnownProductPairs(messages);
+        if (call.function.name === "previewOrder") previewOrder = null;
+        const knownPairs = extractKnownProductPairs(messages, args.deptId);
         const ungrounded = findUngroundedItems(args, knownPairs);
         if (ungrounded.length > 0) {
           console.error(`[拦截未验证商品] tool=${call.function.name} ungrounded=${JSON.stringify(ungrounded)}`);
@@ -270,11 +320,19 @@ export async function runBaristaTurn({ systemPrompt, history, mcpUrl, mcpToken, 
 
       let result;
       try {
-        result = await mcpCallTool(mcpUrl, mcpToken, call.function.name, args);
+        // 地图工具使用 maps_ 前缀；其余工具仍走瑞幸 MCP。这样模型可以在同一轮
+        // 先把“国贸附近”解析成坐标，再用瑞幸 queryShopList 找真实门店。
+        const server = mcpServers.find((item) =>
+          item.toolPrefix ? call.function.name.startsWith(item.toolPrefix) : item.toolNames?.includes(call.function.name)
+        ) ?? { url: mcpUrl, token: mcpToken };
+        result = await mcpCallTool(server.url, server.token, call.function.name, args);
         console.log(`[工具结果] tool=${call.function.name} result=${JSON.stringify(result).slice(0, 500)}`);
         if (call.function.name === "createOrder" && result?.data?.payOrderQrCodeUrl) {
           orderQrCodeUrl = result.data.payOrderQrCodeUrl;
           orderedItems = args.productList ?? args.items ?? null;
+        }
+        if (call.function.name === "previewOrder" && result?.data && !result.error && result.success !== false && (result.code == null || Number(result.code) === 0)) {
+          previewOrder = { args, result };
         }
       } catch (err) {
         result = { error: String(err) };
@@ -284,7 +342,7 @@ export async function runBaristaTurn({ systemPrompt, history, mcpUrl, mcpToken, 
     }
 
     if (stopResult) {
-      return { ...stopResult, updatedHistory: messages.slice(1) };
+      return { ...stopResult, updatedHistory: messages.slice(1), previewOrder };
     }
   }
 
